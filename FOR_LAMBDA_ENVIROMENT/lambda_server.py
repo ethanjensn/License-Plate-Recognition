@@ -1,6 +1,3 @@
-# lambda_server.py
-# source LPR/venv/bin/activate
-
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 import cv2
@@ -31,9 +28,6 @@ try:
 except ImportError:
     # If PIL is not available, use a default value
     ANTIALIAS = None
-
-# https://g.co/gemini/share/01da3133756f
-# https://g.co/gemini/share/a32b188ddc38
 
 # ==== CONFIGURATION (Server-side) ====
 # IMPORTANT: Adjust this path on your Lambda Labs instance
@@ -261,4 +255,5 @@ async def detect_plates(file: UploadFile = File(...)):
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=5000)
