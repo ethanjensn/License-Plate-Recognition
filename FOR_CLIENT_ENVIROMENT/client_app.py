@@ -1,8 +1,3 @@
-# client_app2_http.py
-# python LAMBDA\GEMINI\client_app2_http.py
-# HTTP version that works with lambda_server3.py
-# .\lpr_env_laptop\Scripts\Activate.ps1
-
 import cv2
 import requests
 import json
@@ -176,4 +171,5 @@ if __name__ == "__main__":
 
     # Cleanup
     cap.release()
+
     cv2.destroyAllWindows() 
