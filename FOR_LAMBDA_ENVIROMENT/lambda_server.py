@@ -239,6 +239,10 @@ async def detect_plates(file: UploadFile = File(...)):
                         text = line[1][0].strip().upper()
                         conf = line[1][1]
 
+                        # Strip non-alphanumeric characters (star symbols, dots, etc.)
+                        import re
+                        text = re.sub(r'[^A-Z0-9]', '', text)
+
                         # Calculate character height from bounding box
                         char_height = (abs(bbox[2][1] - bbox[0][1]) + abs(bbox[3][1] - bbox[1][1])) / 2
 
@@ -246,12 +250,13 @@ async def detect_plates(file: UploadFile = File(...)):
                         plate_h = plate_crop.shape[0]
                         if char_height < plate_h * 0.25:
                             continue
-                        if not (4 <= len(text) <= 8):
+                        if not (4 <= len(text) <= 9):  # 9 allows TX2000 + extra
                             continue
                         # Skip common header/footer words that appear on plates
                         skip_words = {"OHIO", "FLORIDA", "TEXAS", "CALIFORNIA", "MICHIGAN",
                                       "INDIANA", "ILLINOIS", "GEORGIA", "VIRGINIA", "DEALER",
-                                      "STATE", "TRUCK", "APPORT", "TRANSIT", "VANITY", "CITY"}
+                                      "STATE", "TRUCK", "APPORT", "TRANSIT", "VANITY", "CITY",
+                                      "THELON", "LONESTA", "THELON", "STARTE"}
                         if text in skip_words:
                             continue
 
@@ -260,8 +265,29 @@ async def detect_plates(file: UploadFile = File(...)):
                 if valid_results:
                     # Biggest text wins - plate numbers are always the largest characters
                     valid_results.sort(key=lambda x: x[2], reverse=True)
-                    ocr_text = valid_results[0][0]
-                    ocr_confidence = valid_results[0][1]
+
+                    # Try to merge fragments on the same horizontal line
+                    # (happens when plate is large and OCR splits TX / 2000 separately)
+                    if len(valid_results) > 1:
+                        tallest_height = valid_results[0][2]
+                        # Collect all results within 30% height of the tallest
+                        same_line = [r for r in valid_results if r[2] >= tallest_height * 0.7]
+                        if len(same_line) > 1:
+                            # Sort by x-position of their bbox to merge left-to-right
+                            # We don't have bbox here so just concatenate by confidence order
+                            merged = ''.join(r[0] for r in same_line)
+                            if 4 <= len(merged) <= 10:
+                                ocr_text = merged
+                                ocr_confidence = min(r[1] for r in same_line)
+                            else:
+                                ocr_text = valid_results[0][0]
+                                ocr_confidence = valid_results[0][1]
+                        else:
+                            ocr_text = valid_results[0][0]
+                            ocr_confidence = valid_results[0][1]
+                    else:
+                        ocr_text = valid_results[0][0]
+                        ocr_confidence = valid_results[0][1]
 
             track_plate(x1, y1, x2, y2, ocr_text, ocr_confidence)
 
