@@ -3,22 +3,26 @@ import requests
 import json
 import time
 import threading
-import queue
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # --- Configuration ---
 # IMPORTANT: Replace with your Lambda Labs server's public IP
-SERVER_URL = "http://141.148.35.122:5000/detect_plates/"
+SERVER_URL = "http://127.0.0.1:5000/detect_plates/"
 RESIZE_DIM = (1280, 720) # 720p resolution
 JPEG_QUALITY = 100 # 100% quality for best OCR
 
-# Thread-safe queues
-frame_queue = queue.Queue(maxsize=2)
-result_queue = queue.Queue(maxsize=2)
+# Shared frame/result state (no queueing)
+frame_condition = threading.Condition()
+frame_version = 0
+shared_frame = None
+
+result_lock = threading.Lock()
+latest_results = {"detections": []}
 
 def network_worker():
     """Background thread for network processing"""
+    global latest_results
     # Create session with connection pooling and retries
     session = requests.Session()
     retry_strategy = Retry(
@@ -36,55 +40,50 @@ def network_worker():
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     
-    frame_count = 0
+    processed_version = 0
     
     while True:
         try:
-            # Get frame from queue
-            frame = frame_queue.get()
-            frame_count += 1
+            # Wait for a new frame (always process the most recent one)
+            with frame_condition:
+                frame_condition.wait_for(lambda: frame_version > processed_version)
+                frame = shared_frame.copy() if shared_frame is not None else None
+                processed_version = frame_version
+
+            if frame is None:
+                continue
+
+            # 1. Resize the frame
+            resized_frame = cv2.resize(frame, RESIZE_DIM)
+
+            # 2. Encode with JPEG quality
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+            _, buffer = cv2.imencode('.jpg', resized_frame, encode_param)
+
+            # 3. Send HTTP POST request with better error handling
+            files = {'file': ('frame.jpg', buffer.tobytes(), 'image/jpeg')}
+            try:
+                response = session.post(SERVER_URL, files=files, timeout=3.0)  # Longer timeout
+            except requests.exceptions.ConnectionError:
+                # Recreate session on connection error
+                session = requests.Session()
+                adapter = HTTPAdapter(
+                    max_retries=retry_strategy, 
+                    pool_connections=20,
+                    pool_maxsize=20,
+                    pool_block=False
+                )
+                session.mount("http://", adapter)
+                session.mount("https://", adapter)
+                response = session.post(SERVER_URL, files=files, timeout=3.0)
             
-            # Skip frames to maintain performance
-            if frame_count % 3 == 0:  # Process every 3rd frame
-                # 1. Resize the frame
-                resized_frame = cv2.resize(frame, RESIZE_DIM)
-
-                # 2. Encode with JPEG quality
-                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
-                _, buffer = cv2.imencode('.jpg', resized_frame, encode_param)
-
-                # 3. Send HTTP POST request with better error handling
-                files = {'file': ('frame.jpg', buffer.tobytes(), 'image/jpeg')}
-                try:
-                    response = session.post(SERVER_URL, files=files, timeout=3.0)  # Longer timeout
-                except requests.exceptions.ConnectionError:
-                    # Recreate session on connection error
-                    session = requests.Session()
-                    adapter = HTTPAdapter(
-                        max_retries=retry_strategy, 
-                        pool_connections=20,
-                        pool_maxsize=20,
-                        pool_block=False
-                    )
-                    session.mount("http://", adapter)
-                    session.mount("https://", adapter)
-                    response = session.post(SERVER_URL, files=files, timeout=3.0)
-                
-                if response.status_code == 200:
-                    results = response.json()
-                    print(f"Received {len(results.get('detections', []))} detections")
-                    
-                    # Put result in queue, replace if full
-                    try:
-                        result_queue.put_nowait(results)
-                    except queue.Full:
-                        try:
-                            result_queue.get_nowait()  # Remove old result
-                        except queue.Empty:
-                            pass
-                        result_queue.put_nowait(results)
-                else:
-                    print(f"Server error: {response.status_code}")
+            if response.status_code == 200:
+                results = response.json()
+                print(f"Received {len(results.get('detections', []))} detections")
+                with result_lock:
+                    latest_results = results
+            else:
+                print(f"Server error: {response.status_code}")
                     
         except Exception as e:
             print(f"Network error: {e}")
@@ -94,7 +93,7 @@ def network_worker():
 # --- Main Application Logic ---
 if __name__ == "__main__":
     # --- OpenCV Video Capture and Display Logic ---
-    cap = cv2.VideoCapture(1)
+    cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Error: Could not open camera.")
         exit()
@@ -110,8 +109,6 @@ if __name__ == "__main__":
     
     print(f"Camera initialized: {cap.get(cv2.CAP_PROP_FRAME_WIDTH)}x{cap.get(cv2.CAP_PROP_FRAME_HEIGHT)} @ {cap.get(cv2.CAP_PROP_FPS)} FPS")
 
-    latest_results = {"detections": []}
-    
     # Start network worker thread
     network_thread = threading.Thread(target=network_worker, daemon=True)
     network_thread.start()
@@ -121,26 +118,29 @@ if __name__ == "__main__":
         if not ret:
             break
 
-        # Send frame to network thread (non-blocking)
-        try:
-            frame_queue.put_nowait(frame.copy())
-        except queue.Full:
-            # Skip frame if queue is full
-            pass
+        # Publish frame to the network worker (always overwrite with latest frame)
+        with frame_condition:
+            shared_frame = frame.copy()
+            frame_version += 1
+            frame_condition.notify()
 
-        # Get latest results from network thread (non-blocking)
-        try:
-            latest_results = result_queue.get_nowait()
-        except queue.Empty:
-            # Keep using previous results if no new ones
-            pass
+        # Snapshot latest detections without blocking rendering
+        with result_lock:
+            detections_snapshot = [
+                {
+                    "bbox": det["bbox"][:],
+                    "text": det["text"],
+                    "confidence": det["confidence"],
+                }
+                for det in latest_results.get("detections", [])
+            ]
 
         # Draw detections from latest results
-        if "detections" in latest_results:
+        if detections_snapshot:
             # Get current frame dimensions for scaling
             frame_h, frame_w = frame.shape[:2]
             
-            for detection in latest_results["detections"]:
+            for detection in detections_snapshot:
                 x1, y1, x2, y2 = detection['bbox']
                 text = detection['text']
                 confidence = detection['confidence']
