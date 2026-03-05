@@ -1,3 +1,2 @@
-__pycache__
-detection-validation
-ffmpeg_service.py
+__pycache__/
+detection-validation/*
