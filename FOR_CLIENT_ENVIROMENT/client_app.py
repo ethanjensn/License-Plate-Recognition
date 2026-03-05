@@ -1,17 +1,38 @@
 import argparse
 import cv2
-import requests
 import json
 import time
 import threading
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from websocket import create_connection, WebSocketTimeoutException
 
 # --- Configuration ---
-# IMPORTANT: Replace with your Lambda Labs server's public IP
-SERVER_URL = "http://127.0.0.1:5000/detect_plates/"
+SERVER_URL = "ws://127.0.0.1:5000/ws/detect"
 RESIZE_DIM = (960, 540) # 720p resolution
-JPEG_QUALITY = 80 # 100% quality for best OCR
+JPEG_QUALITY = 100 # 100% quality for best OCR
+
+
+def draw_detection_overlay(frame, detections):
+    frame_h, frame_w = frame.shape[:2]
+    scale_x = frame_w / RESIZE_DIM[0]
+    scale_y = frame_h / RESIZE_DIM[1]
+
+    for detection in detections:
+        x1, y1, x2, y2 = detection["bbox"]
+        text = detection["text"]
+        confidence = detection["confidence"]
+
+        x1_scaled = int(x1 * scale_x)
+        y1_scaled = int(y1 * scale_y)
+        x2_scaled = int(x2 * scale_x)
+        y2_scaled = int(y2 * scale_y)
+
+        cv2.rectangle(frame, (x1_scaled, y1_scaled), (x2_scaled, y2_scaled), (0, 255, 0), 2)
+
+        label = f"{text} ({confidence:.2f})"
+        label_width = max(140, (len(label) * 10) + 10)
+        label_top = max(0, y1_scaled - 20)
+        cv2.rectangle(frame, (x1_scaled, label_top), (x1_scaled + label_width, y1_scaled), (0, 255, 0), -1)
+        cv2.putText(frame, label, (x1_scaled + 5, y1_scaled - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
 # Shared frame/result state (no queueing)
 frame_condition = threading.Condition()
@@ -23,7 +44,6 @@ latest_results = {"detections": []}
 
 processed_condition = threading.Condition()
 processed_version = 0
-processed_frame = None
 processed_detections = []
 
 
@@ -43,37 +63,26 @@ def parse_args():
     return parser.parse_args()
 
 def network_worker():
-    """Background thread for network processing"""
-    global latest_results, processed_frame, processed_detections, processed_version
-    # Create session with connection pooling and retries
-    session = requests.Session()
-    retry_strategy = Retry(
-        total=5,  # More retries
-        backoff_factor=0.1,
-        status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["POST", "GET"]  # Allow POST retries
-    )
-    adapter = HTTPAdapter(
-        max_retries=retry_strategy, 
-        pool_connections=20,  # More connections
-        pool_maxsize=20,      # Larger pool
-        pool_block=False      # Don't block when pool is full
-    )
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    
-    processed_version = 0
+    """Background thread for WebSocket metadata streaming"""
+    global latest_results, processed_detections, processed_version
+    last_processed_frame_version = 0
+    ws = None
     
     while True:
         try:
+            if ws is None:
+                ws = create_connection(SERVER_URL, timeout=3)
+
             # Wait for a new frame (always process the most recent one)
             with frame_condition:
-                frame_condition.wait_for(lambda: frame_version > processed_version)
+                frame_condition.wait_for(lambda: frame_version > last_processed_frame_version)
                 frame = shared_frame.copy() if shared_frame is not None else None
-                processed_version = frame_version
+                current_frame_version = frame_version
 
             if frame is None:
                 continue
+
+            last_processed_frame_version = current_frame_version
 
             # 1. Resize the frame
             resized_frame = cv2.resize(frame, RESIZE_DIM)
@@ -82,46 +91,37 @@ def network_worker():
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
             _, buffer = cv2.imencode('.jpg', resized_frame, encode_param)
 
-            # 3. Send HTTP POST request with better error handling
-            files = {'file': ('frame.jpg', buffer.tobytes(), 'image/jpeg')}
+            ws.send_binary(buffer.tobytes())
             try:
-                response = session.post(SERVER_URL, files=files, timeout=3.0)  # Longer timeout
-            except requests.exceptions.ConnectionError:
-                # Recreate session on connection error
-                session = requests.Session()
-                adapter = HTTPAdapter(
-                    max_retries=retry_strategy, 
-                    pool_connections=20,
-                    pool_maxsize=20,
-                    pool_block=False
-                )
-                session.mount("http://", adapter)
-                session.mount("https://", adapter)
-                response = session.post(SERVER_URL, files=files, timeout=3.0)
-            
-            if response.status_code == 200:
-                results = response.json()
-                detections = results.get('detections', [])
-                print(f"Received {len(detections)} detections")
-                with result_lock:
-                    latest_results = results
-                with processed_condition:
-                    processed_frame = frame
-                    processed_detections = [
-                        {
-                            "bbox": det["bbox"][:],
-                            "text": det["text"],
-                            "confidence": det["confidence"],
-                        }
-                        for det in detections
-                    ]
-                    processed_version += 1
-                    processed_condition.notify()
-            else:
-                print(f"Server error: {response.status_code}")
+                message = ws.recv()
+            except WebSocketTimeoutException:
+                continue
+
+            results = json.loads(message)
+            detections = results.get('detections', [])
+            print(f"Received {len(detections)} detections")
+            with result_lock:
+                latest_results = results
+            with processed_condition:
+                processed_detections = [
+                    {
+                        "bbox": det["bbox"][:],
+                        "text": det["text"],
+                        "confidence": det["confidence"],
+                    }
+                    for det in detections
+                ]
+                processed_version += 1
+                processed_condition.notify()
                     
         except Exception as e:
             print(f"Network error: {e}")
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                ws = None
             # Continue processing
             time.sleep(0.1)  # Brief pause on error
 
@@ -200,48 +200,35 @@ if __name__ == "__main__":
     capture_thread = threading.Thread(target=capture_worker, daemon=True)
     capture_thread.start()
 
-    displayed_version = 0
+    displayed_frame_version = 0
+    latest_displayed_detection_version = 0
+    latest_display_detections = []
 
     while not stop_event.is_set():
-        with processed_condition:
-            processed_condition.wait_for(
-                lambda: processed_version > displayed_version or stop_event.is_set()
-            )
-            if stop_event.is_set() and processed_version <= displayed_version:
+        with frame_condition:
+            frame_condition.wait_for(lambda: frame_version > displayed_frame_version or stop_event.is_set())
+            if stop_event.is_set() and shared_frame is None:
                 break
-            frame_to_show = None if processed_frame is None else processed_frame.copy()
-            detections_snapshot = [
-                {
-                    "bbox": det["bbox"][:],
-                    "text": det["text"],
-                    "confidence": det["confidence"],
-                }
-                for det in processed_detections
-            ]
-            displayed_version = processed_version
+            frame_to_show = None if shared_frame is None else shared_frame.copy()
+            displayed_frame_version = frame_version
 
         if frame_to_show is None:
             continue
 
-        if detections_snapshot:
-            frame_h, frame_w = frame_to_show.shape[:2]
+        with processed_condition:
+            if processed_version > latest_displayed_detection_version:
+                latest_display_detections = [
+                    {
+                        "bbox": det["bbox"][:],
+                        "text": det["text"],
+                        "confidence": det["confidence"],
+                    }
+                    for det in processed_detections
+                ]
+                latest_displayed_detection_version = processed_version
 
-            for detection in detections_snapshot:
-                x1, y1, x2, y2 = detection['bbox']
-                text = detection['text']
-                confidence = detection['confidence']
-
-                scale_x = frame_w / RESIZE_DIM[0]
-                scale_y = frame_h / RESIZE_DIM[1]
-
-                x1_scaled = int(x1 * scale_x)
-                y1_scaled = int(y1 * scale_y)
-                x2_scaled = int(x2 * scale_x)
-                y2_scaled = int(y2 * scale_y)
-
-                cv2.rectangle(frame_to_show, (x1_scaled, y1_scaled), (x2_scaled, y2_scaled), (0, 255, 0), 2)
-                label = f"{text} ({confidence:.2f})"
-                cv2.putText(frame_to_show, label, (x1_scaled, y1_scaled - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        if latest_display_detections:
+            draw_detection_overlay(frame_to_show, latest_display_detections)
 
         cv2.imshow('Real-time License Plate Detection', frame_to_show)
 
