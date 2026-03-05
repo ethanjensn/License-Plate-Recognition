@@ -68,14 +68,13 @@ logging.getLogger("ppocr").setLevel(logging.WARNING)
 YOLO_MODEL_PATH = 'best.pt'
 USE_GPU = True
 CONFIDENCE_THRESHOLD = 0.3
+OCR_MAX_PER_FRAME = 1  # Limit expensive OCR calls per frame
 
 app = FastAPI()
 
 # ==== GLOBALS ====
 detection_model = None
 ocr_process = None
-plate_tracker = {}
-tracker_counter = 0
 
 
 def send_ocr_request(plate_crop: np.ndarray):
@@ -143,7 +142,11 @@ async def startup_event():
         detection_model = YOLO(YOLO_MODEL_PATH)
         if USE_GPU and torch.cuda.is_available():
             detection_model.to('cuda')
-            print("[INFO] YOLO running on GPU.")
+            try:
+                detection_model.model.half()
+                print("[INFO] YOLO running on GPU (FP16).")
+            except AttributeError:
+                print("[INFO] YOLO running on GPU (FP32 fallback).")
         else:
             detection_model.to('cpu')
             print("[INFO] YOLO running on CPU.")
@@ -162,42 +165,6 @@ async def shutdown_event():
         ocr_process.terminate()
 
 
-def track_plate(x1, y1, x2, y2, text, confidence):
-    global plate_tracker, tracker_counter
-    center_x = (x1 + x2) / 2
-    center_y = (y1 + y2) / 2
-
-    matched_id = None
-    for plate_id, plate_data in plate_tracker.items():
-        existing_center_x = (plate_data['bbox'][0] + plate_data['bbox'][2]) / 2
-        existing_center_y = (plate_data['bbox'][1] + plate_data['bbox'][3]) / 2
-
-        if ((center_x - existing_center_x) ** 2 + (center_y - existing_center_y) ** 2) ** 0.5 < 150:
-            matched_id = plate_id
-            break
-
-    if matched_id is not None:
-        if confidence > plate_tracker[matched_id]['confidence']:
-            plate_tracker[matched_id] = {'bbox': [int(x1), int(y1), int(x2), int(y2)], 'text': str(text), 'confidence': float(confidence), 'last_seen': time.time()}
-        else:
-            plate_tracker[matched_id]['bbox'] = [int(x1), int(y1), int(x2), int(y2)]
-            plate_tracker[matched_id]['last_seen'] = time.time()
-    else:
-        tracker_counter += 1
-        matched_id = tracker_counter
-        plate_tracker[matched_id] = {'bbox': [int(x1), int(y1), int(x2), int(y2)], 'text': str(text), 'confidence': float(confidence), 'last_seen': time.time()}
-
-    return plate_tracker[matched_id]
-
-
-def cleanup_old_plates():
-    global plate_tracker
-    current_time = time.time()
-    plates_to_remove = [pid for pid, data in plate_tracker.items() if current_time - data['last_seen'] > 1.0]
-    for pid in plates_to_remove:
-        del plate_tracker[pid]
-
-
 @app.post("/detect_plates/")
 async def detect_plates(file: UploadFile = File(...)):
     if detection_model is None or ocr_process is None:
@@ -212,13 +179,19 @@ async def detect_plates(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Could not decode image.")
 
         start_time = time.time()
-        cleanup_old_plates()
-
         results = detection_model(frame, verbose=False, conf=CONFIDENCE_THRESHOLD, iou=0.5)
         boxes = results[0].boxes.xyxy.cpu().numpy().astype(int) if results[0].boxes is not None else []
         confidences = results[0].boxes.conf.cpu().numpy() if results[0].boxes is not None else []
 
-        for i, (x1, y1, x2, y2) in enumerate(boxes):
+        detected_plates_data = []
+        ocr_budget = OCR_MAX_PER_FRAME
+        sorted_indices = (
+            np.argsort(confidences)[::-1]
+            if len(confidences) > 0 else range(len(boxes))
+        )
+
+        for idx in sorted_indices:
+            x1, y1, x2, y2 = boxes[idx]
             h, w, _ = frame.shape
             x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
 
@@ -227,10 +200,16 @@ async def detect_plates(file: UploadFile = File(...)):
 
             plate_crop = frame[y1:y2, x1:x2]
             ocr_text = "DETECTED"
-            ocr_confidence = float(confidences[i]) if i < len(confidences) else 0.5
+            ocr_confidence = float(confidences[idx]) if idx < len(confidences) else 0.5
 
-            if plate_crop.size > 0 and plate_crop.shape[0] > 8 and plate_crop.shape[1] > 20:
+            if (
+                ocr_budget > 0
+                and plate_crop.size > 0
+                and plate_crop.shape[0] > 8
+                and plate_crop.shape[1] > 20
+            ):
                 ocr_result = send_ocr_request(plate_crop)
+                ocr_budget -= 1
 
                 valid_results = []
                 if ocr_result and ocr_result[0]:
@@ -289,12 +268,11 @@ async def detect_plates(file: UploadFile = File(...)):
                         ocr_text = valid_results[0][0]
                         ocr_confidence = valid_results[0][1]
 
-            track_plate(x1, y1, x2, y2, ocr_text, ocr_confidence)
-
-        detected_plates_data = [
-            {"bbox": [int(x) for x in data['bbox']], "text": str(data['text']), "confidence": float(data['confidence'])}
-            for pid, data in plate_tracker.items()
-        ]
+            detected_plates_data.append({
+                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                "text": str(ocr_text),
+                "confidence": float(ocr_confidence)
+            })
 
         return JSONResponse(content={
             "detections": detected_plates_data,
