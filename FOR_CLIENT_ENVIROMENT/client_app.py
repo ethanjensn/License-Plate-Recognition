@@ -7,14 +7,50 @@ from websocket import create_connection, WebSocketTimeoutException
 
 # --- Configuration ---
 SERVER_URL = "ws://127.0.0.1:5000/ws/detect"
-RESIZE_DIM = (960, 540) # 720p resolution
+MAX_INFERENCE_WIDTH = 960
+MAX_INFERENCE_HEIGHT = 540
+MAX_DISPLAY_WIDTH = 1280
+MAX_DISPLAY_HEIGHT = 900
 JPEG_QUALITY = 100 # 100% quality for best OCR
 
 
-def draw_detection_overlay(frame, detections):
+def compute_inference_dimensions(frame_width, frame_height):
+    scale = min(
+        MAX_INFERENCE_WIDTH / frame_width,
+        MAX_INFERENCE_HEIGHT / frame_height,
+    )
+    scale = min(scale, 1.0)
+
+    resized_width = max(1, int(round(frame_width * scale)))
+    resized_height = max(1, int(round(frame_height * scale)))
+
+    return resized_width, resized_height
+
+
+def compute_display_dimensions(frame_width, frame_height):
+    scale = min(
+        MAX_DISPLAY_WIDTH / frame_width,
+        MAX_DISPLAY_HEIGHT / frame_height,
+        1.0,
+    )
+
+    display_width = max(1, int(round(frame_width * scale)))
+    display_height = max(1, int(round(frame_height * scale)))
+
+    return display_width, display_height
+
+
+def draw_detection_overlay(frame, detections, inference_dim):
     frame_h, frame_w = frame.shape[:2]
-    scale_x = frame_w / RESIZE_DIM[0]
-    scale_y = frame_h / RESIZE_DIM[1]
+    inference_w, inference_h = inference_dim
+    scale_x = frame_w / inference_w
+    scale_y = frame_h / inference_h
+    display_scale = min(frame_w / 1280.0, frame_h / 720.0)
+    box_thickness = max(2, int(round(display_scale * 3)))
+    font_scale = max(0.6, display_scale * 0.9)
+    font_thickness = max(1, int(round(display_scale * 1.5)))
+    label_padding_x = max(6, int(round(display_scale * 8)))
+    label_padding_y = max(4, int(round(display_scale * 6)))
 
     for detection in detections:
         x1, y1, x2, y2 = detection["bbox"]
@@ -26,18 +62,38 @@ def draw_detection_overlay(frame, detections):
         x2_scaled = int(x2 * scale_x)
         y2_scaled = int(y2 * scale_y)
 
-        cv2.rectangle(frame, (x1_scaled, y1_scaled), (x2_scaled, y2_scaled), (0, 255, 0), 2)
+        cv2.rectangle(frame, (x1_scaled, y1_scaled), (x2_scaled, y2_scaled), (0, 255, 0), box_thickness)
 
         label = f"{text} ({confidence:.2f})"
-        label_width = max(140, (len(label) * 10) + 10)
-        label_top = max(0, y1_scaled - 20)
-        cv2.rectangle(frame, (x1_scaled, label_top), (x1_scaled + label_width, y1_scaled), (0, 255, 0), -1)
-        cv2.putText(frame, label, (x1_scaled + 5, y1_scaled - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        (text_width, text_height), baseline = cv2.getTextSize(
+            label,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            font_thickness,
+        )
+        label_width = text_width + (label_padding_x * 2)
+        label_height = text_height + baseline + (label_padding_y * 2)
+        label_top = max(0, y1_scaled - label_height)
+        label_bottom = label_top + label_height
+        cv2.rectangle(frame, (x1_scaled, label_top), (x1_scaled + label_width, label_bottom), (0, 255, 0), -1)
+        text_x = x1_scaled + label_padding_x
+        text_y = label_bottom - baseline - label_padding_y
+        cv2.putText(
+            frame,
+            label,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (0, 0, 0),
+            font_thickness,
+            cv2.LINE_AA,
+        )
 
 # Shared frame/result state (no queueing)
 frame_condition = threading.Condition()
 frame_version = 0
 shared_frame = None
+shared_inference_dim = (MAX_INFERENCE_WIDTH, MAX_INFERENCE_HEIGHT)
 
 result_lock = threading.Lock()
 latest_results = {"detections": []}
@@ -45,6 +101,7 @@ latest_results = {"detections": []}
 processed_condition = threading.Condition()
 processed_version = 0
 processed_detections = []
+processed_inference_dim = (MAX_INFERENCE_WIDTH, MAX_INFERENCE_HEIGHT)
 
 
 def parse_args():
@@ -64,7 +121,7 @@ def parse_args():
 
 def network_worker():
     """Background thread for WebSocket metadata streaming"""
-    global latest_results, processed_detections, processed_version
+    global latest_results, processed_detections, processed_version, processed_inference_dim
     last_processed_frame_version = 0
     ws = None
     
@@ -77,6 +134,7 @@ def network_worker():
             with frame_condition:
                 frame_condition.wait_for(lambda: frame_version > last_processed_frame_version)
                 frame = shared_frame.copy() if shared_frame is not None else None
+                inference_dim = shared_inference_dim
                 current_frame_version = frame_version
 
             if frame is None:
@@ -85,7 +143,7 @@ def network_worker():
             last_processed_frame_version = current_frame_version
 
             # 1. Resize the frame
-            resized_frame = cv2.resize(frame, RESIZE_DIM)
+            resized_frame = cv2.resize(frame, inference_dim)
 
             # 2. Encode with JPEG quality
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
@@ -111,6 +169,7 @@ def network_worker():
                     }
                     for det in detections
                 ]
+                processed_inference_dim = inference_dim
                 processed_version += 1
                 processed_condition.notify()
                     
@@ -132,6 +191,9 @@ if __name__ == "__main__":
     # --- OpenCV Video Capture and Display Logic ---
     frame_interval = None
     last_frame_time = None
+    source_width = None
+    source_height = None
+    window_name = 'Real-time License Plate Detection'
 
     if args.video:
         print(f"Using video file: {args.video}")
@@ -151,6 +213,12 @@ if __name__ == "__main__":
         print(f"Error: Could not open {source}.")
         exit()
 
+    source_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    source_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    if source_width <= 0 or source_height <= 0:
+        source_width, source_height = 1280, 720
+
     if not args.video:
         # Set camera properties for consistent performance
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
@@ -166,6 +234,18 @@ if __name__ == "__main__":
             f"{cap.get(cv2.CAP_PROP_FRAME_WIDTH)}x{cap.get(cv2.CAP_PROP_FRAME_HEIGHT)}"
             f" @ {cap.get(cv2.CAP_PROP_FPS)} FPS"
         )
+
+        source_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        source_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        if source_width <= 0 or source_height <= 0:
+            source_width, source_height = 1280, 720
+
+    shared_inference_dim = compute_inference_dimensions(source_width, source_height)
+    display_width, display_height = compute_display_dimensions(source_width, source_height)
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, display_width, display_height)
 
     stop_event = threading.Event()
 
@@ -203,6 +283,7 @@ if __name__ == "__main__":
     displayed_frame_version = 0
     latest_displayed_detection_version = 0
     latest_display_detections = []
+    latest_display_inference_dim = shared_inference_dim
 
     while not stop_event.is_set():
         with frame_condition:
@@ -225,12 +306,13 @@ if __name__ == "__main__":
                     }
                     for det in processed_detections
                 ]
+                latest_display_inference_dim = processed_inference_dim
                 latest_displayed_detection_version = processed_version
 
         if latest_display_detections:
-            draw_detection_overlay(frame_to_show, latest_display_detections)
+            draw_detection_overlay(frame_to_show, latest_display_detections, latest_display_inference_dim)
 
-        cv2.imshow('Real-time License Plate Detection', frame_to_show)
+        cv2.imshow(window_name, frame_to_show)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             stop_event.set()
