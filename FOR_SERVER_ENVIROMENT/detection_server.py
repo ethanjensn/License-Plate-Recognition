@@ -519,7 +519,10 @@ async def scan_video(request: ScanVideoRequest):
         cap.release()
     
     processing_time = time.time() - start_time
-    plates_list = list(unique_plates.keys())
+    plates_list = [
+        {"plate": text, "confidence": round(info["confidence"], 3), "api_synced": info["api_synced"]}
+        for text, info in unique_plates.items()
+    ]
     api_synced_count = sum(1 for p in unique_plates.values() if p["api_synced"])
     
     return JSONResponse(content={
