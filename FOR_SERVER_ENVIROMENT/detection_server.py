@@ -59,7 +59,10 @@ import torch
 from ultralytics import YOLO
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 from fastapi.responses import JSONResponse
+from fastapi_mcp import FastApiMCP
+import httpx
 import cv2
 import numpy as np
 import time
@@ -68,7 +71,7 @@ import logging
 logging.getLogger("ppocr").setLevel(logging.WARNING)
 
 # ==== CONFIGURATION ====
-YOLO_MODEL_PATH = 'best.pt'
+YOLO_MODEL_PATH = 'FOR_SERVER_ENVIROMENT/best.pt'
 USE_GPU = True
 CONFIDENCE_THRESHOLD = 0.3
 OCR_MAX_PER_FRAME = 1  # Limit expensive OCR calls per frame
@@ -77,7 +80,14 @@ OCR_CACHE_TTL = 2.0
 TRACK_TTL = 1.0
 TRACK_MATCH_DISTANCE = 120.0
 
-app = FastAPI()
+# Enterprise REST API Configuration
+API_ENDPOINT = os.environ.get("ALPR_API_ENDPOINT", "https://api.enterprise.com/v1/vehicle-logs")
+SOURCE_ID = os.environ.get("ALPR_SOURCE_ID", "DETECTION_VALIDATION")
+VIDEO_DIR = os.environ.get("ALPR_VIDEO_DIR", "detection-validation")
+API_TIMEOUT = 5.0
+MIN_CONFIDENCE_FOR_SYNC = 0.7
+
+app = FastAPI(title="ALPR-Detection-Server")
 
 # ==== GLOBALS ====
 detection_model = None
@@ -85,6 +95,9 @@ ocr_process = None
 ocr_cache = {}
 ocr_cache_lock = threading.Lock()
 ocr_process_lock = threading.Lock()
+
+# HTTP client for REST API calls (initialized on startup)
+api_client: httpx.AsyncClient | None = None
 
 
 def _normalize_text(text: str) -> str:
@@ -183,6 +196,56 @@ def _extract_ocr_text(ocr_result, plate_crop: np.ndarray):
             ocr_confidence = valid_results[0][1]
 
     return ocr_text, ocr_confidence
+
+
+async def _submit_to_rest_api(plate_text: str, confidence: float) -> bool:
+    """Fire-and-forget async submission to enterprise REST API.
+    
+    Returns True if submission succeeded, False otherwise.
+    Defensive error handling: logs failures but never raises.
+    """
+    if api_client is None:
+        print("[REST API] Client not initialized, skipping submission")
+        return False
+    
+    if confidence < MIN_CONFIDENCE_FOR_SYNC:
+        print(f"[REST API] Confidence {confidence:.2f} below threshold {MIN_CONFIDENCE_FOR_SYNC}, skipping")
+        return False
+    
+    payload = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source_id": SOURCE_ID,
+        "detection_type": "ALPR",
+        "payload": {
+            "license_plate": plate_text,
+            "confidence_score": round(confidence, 2)
+        },
+        "network_status": "pending"
+    }
+    
+    try:
+        response = await api_client.post(
+            API_ENDPOINT,
+            json=payload,
+            timeout=API_TIMEOUT
+        )
+        
+        if response.status_code == 201:
+            print(f"[REST API] Successfully synced plate '{plate_text}' (confidence: {confidence:.2f})")
+            return True
+        else:
+            print(f"[REST API] Failed to sync plate '{plate_text}': HTTP {response.status_code}")
+            return False
+            
+    except httpx.TimeoutException:
+        print(f"[REST API] Timeout syncing plate '{plate_text}' after {API_TIMEOUT}s")
+        return False
+    except httpx.ConnectError as e:
+        print(f"[REST API] Connection error syncing plate '{plate_text}': {e}")
+        return False
+    except Exception as e:
+        print(f"[REST API] Unexpected error syncing plate '{plate_text}': {e}")
+        return False
 
 
 def send_ocr_request(plate_crop: np.ndarray):
@@ -288,7 +351,9 @@ def _run_detection_pipeline(frame: np.ndarray, now: float, track_state: dict):
     _prune_ocr_cache(now)
     _prune_tracks(track_state, now)
 
-    results = detection_model(frame, verbose=False, conf=CONFIDENCE_THRESHOLD, iou=0.5)
+    # Force the model and inference to be consistent. 
+    # Ultralytics handles this automatically if you pass half=True
+    results = detection_model(frame, verbose=False, conf=CONFIDENCE_THRESHOLD, iou=0.5, half=True)
     boxes = results[0].boxes.xyxy.cpu().numpy().astype(int) if results[0].boxes is not None else []
     confidences = results[0].boxes.conf.cpu().numpy() if results[0].boxes is not None else []
 
@@ -347,7 +412,7 @@ def _run_detection_pipeline(frame: np.ndarray, now: float, track_state: dict):
 
 @app.on_event("startup")
 async def startup_event():
-    global detection_model
+    global detection_model, api_client
     print("[INFO] Loading models on startup...")
     try:
         start_ocr_worker()
@@ -364,6 +429,11 @@ async def startup_event():
             detection_model.to('cpu')
             print("[INFO] YOLO running on CPU.")
 
+        # Initialize HTTP client for REST API calls
+        api_client = httpx.AsyncClient()
+        print(f"[INFO] REST API client initialized (endpoint: {API_ENDPOINT})")
+        print(f"[INFO] Video source directory: {VIDEO_DIR}")
+
         print("[INFO] All models loaded successfully!")
 
     except Exception as e:
@@ -373,9 +443,94 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global ocr_process
+    global ocr_process, api_client
     if ocr_process:
         ocr_process.terminate()
+    if api_client:
+        await api_client.aclose()
+
+
+class ScanVideoRequest(BaseModel):
+    video_path: str
+
+@app.post("/scan_video")
+async def scan_video(request: ScanVideoRequest):
+    video_path = request.video_path
+    """MCP-callable endpoint: Process a video file and detect license plates.
+    
+    - Runs YOLO detection + PaddleOCR on each frame
+    - Aggregates unique license plates found
+    - Syncs high-confidence detections to enterprise REST API
+    - Returns structured results for AI assistant consumption
+    
+    Video path can be absolute or relative to VIDEO_DIR (detection-validation/).
+    Example: "11939614_2160_3840_60fps.mp4" or "C:/full/path/to/video.mp4"
+    """
+    if detection_model is None or ocr_process is None:
+        raise HTTPException(status_code=503, detail="Models not loaded yet.")
+    
+    # Resolve video path - check absolute first, then relative to VIDEO_DIR
+    resolved_path = video_path
+    if not os.path.exists(resolved_path):
+        resolved_path = os.path.join(VIDEO_DIR, video_path)
+    
+    if not os.path.exists(resolved_path):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Video file not found: '{video_path}' (also checked in '{VIDEO_DIR}/')"
+        )
+    
+    cap = cv2.VideoCapture(resolved_path)
+    if not cap.isOpened():
+        raise HTTPException(status_code=400, detail=f"Could not open video: {video_path}")
+    
+    start_time = time.time()
+    frame_count = 0
+    track_state = {}
+    unique_plates = {}  # plate_text -> {"confidence": float, "api_synced": bool}
+    
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            frame_count += 1
+            now = time.time()
+            
+            # Process frame through detection pipeline
+            detections = _run_detection_pipeline(frame, now, track_state)
+            
+            # Collect unique plates and trigger REST API sync
+            for det in detections:
+                plate_text = det["text"]
+                confidence = det["confidence"]
+                
+                # Track best confidence for each plate
+                if plate_text not in unique_plates or unique_plates[plate_text]["confidence"] < confidence:
+                    unique_plates[plate_text] = {"confidence": confidence, "api_synced": False}
+                    
+                    # Fire-and-forget REST API submission for high-confidence plates
+                    if confidence >= MIN_CONFIDENCE_FOR_SYNC:
+                        asyncio.create_task(_submit_to_rest_api(plate_text, confidence))
+                        unique_plates[plate_text]["api_synced"] = True
+    
+    finally:
+        cap.release()
+    
+    processing_time = time.time() - start_time
+    plates_list = list(unique_plates.keys())
+    api_synced_count = sum(1 for p in unique_plates.values() if p["api_synced"])
+    
+    return JSONResponse(content={
+        "status": "success",
+        "video_path": resolved_path,
+        "plates_detected": plates_list,
+        "total_frames_processed": frame_count,
+        "api_synced": api_synced_count > 0,
+        "api_synced_count": api_synced_count,
+        "processing_time_seconds": round(processing_time, 2)
+    })
 
 
 @app.post("/detect_plates/")
@@ -445,6 +600,10 @@ async def detect_stream(websocket: WebSocket):
     except Exception:
         await websocket.close(code=1011)
 
+
+# Mount MCP layer after all routes are defined so fastapi-mcp picks them all up
+mcp = FastApiMCP(app)
+mcp.mount_http()
 
 if __name__ == "__main__":
     import uvicorn
