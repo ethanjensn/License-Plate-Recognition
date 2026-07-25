@@ -193,6 +193,57 @@ Camera/Video → Client Capture → WebSocket Frame Stream → Server YOLO + Tra
 - Dynamic inference sizing for better quality/performance tradeoffs
 - Local overlay rendering to avoid returning rendered video from the server
 
+## Performance Evaluation
+
+A reproducible evaluation script is provided at `detection-validation/evaluate_alpr.py`. It measures detection accuracy against the YOLO-formatted `license plate recognition.v2` dataset and benchmarks speed, tracking, and resource utilization on the extracted video frames.
+
+```bash
+python detection-validation/evaluate_alpr.py --mode all --output alpr_results.json
+```
+
+> **Test configuration:** `FOR_SERVER_ENVIROMENT/best.pt`, confidence threshold `0.3`, NMS IoU `0.5`, GPU inference, no OCR enabled.
+
+### Detection Accuracy
+
+Evaluated on the `valid` + `test` splits (766 images, 765 ground-truth plates).
+
+| Metric | IoU = 0.5 | IoU = 0.75 |
+|---|---|---|
+| TP / FP / FN | 318 / 56 / 447 | 120 / 254 / 645 |
+| Precision | 0.8503 | 0.3209 |
+| Recall | 0.4157 | 0.1569 |
+| F1 | 0.5584 | 0.2107 |
+| AP | 0.399 | 0.0657 |
+
+The model is precise when it detects a plate, but recall drops sharply in the flooding-video test data, indicating room for improvement on occluded, distant, or water-sprayed plates.
+
+### Speed / Throughput
+
+Measured on all 3000 frames in `detection-validation/extracted_frames`.
+
+| Metric | Value |
+|---|---|
+| Frames processed | 3000 |
+| Wall time | 34.93 s |
+| Throughput | 85.89 FPS |
+| Mean latency | 11.6 ms |
+| Median latency | 11.1 ms |
+| p95 latency | 15.3 ms |
+| p99 latency | 18.0 ms |
+| Max latency | 22.9 ms |
+
+### Tracking Quality
+
+| Metric | Value |
+|---|---|
+| Unique track IDs | 5 |
+| Mean track length | 46 frames |
+| Max track length | 171 frames |
+| Internal ID switches | 0 |
+
+Ground-truth track IDs are not included in the provided labels, so standard IDF1/MOTA could not be computed. The internal tracker statistics show stable identity assignment across the clip.
+
+
 ## Requirements
 
 ### Server Dependencies
