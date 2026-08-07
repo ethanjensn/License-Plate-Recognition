@@ -420,14 +420,25 @@ async def startup_event():
         detection_model = YOLO(YOLO_MODEL_PATH)
         if USE_GPU and torch.cuda.is_available():
             detection_model.to('cuda')
-            try:
-                detection_model.model.half()
-                print("[INFO] YOLO running on GPU (FP16).")
-            except AttributeError:
-                print("[INFO] YOLO running on GPU (FP32 fallback).")
+            print("[INFO] YOLO running on GPU (FP16 via half=True per-call).")
         else:
             detection_model.to('cpu')
             print("[INFO] YOLO running on CPU.")
+
+        # NOTE: we intentionally do NOT call detection_model.model.half() here.
+        # Ultralytics' own predict()/__call__() already fuses Conv+BatchNorm
+        # layers and casts to FP16 internally when half=True is passed (see
+        # the real inference call below). Manually half()-ing the raw model
+        # before that fuse step ran left some buffers in float32 and others
+        # in float16, causing "expected mat1 and mat2 to have the same
+        # dtype... c10::Half != float" on the first call to the model.
+
+        # Warm-up inference: runs the fuse+half setup now, during startup,
+        # instead of on the first real request, so users don't hit a slow
+        # (or previously, failing) first request.
+        dummy_frame = np.zeros((640, 640, 3), dtype=np.uint8)
+        detection_model(dummy_frame, verbose=False, conf=CONFIDENCE_THRESHOLD, iou=0.5, half=True)
+        print("[INFO] GPU warm-up inference complete.")
 
         # Initialize HTTP client for REST API calls
         api_client = httpx.AsyncClient()
